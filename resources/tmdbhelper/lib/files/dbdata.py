@@ -128,7 +128,8 @@ class DatabaseCore:
             try:
                 connection.close()
             except Exception as close_error:
-                self.kodi_log(f'CACHE: ERROR while closing failed _database setup: {close_error}\n{self._sc_name}', 2)
+                self._log_cleanup_error(
+                    close_error, prefix='CACHE: ERROR while closing failed _database setup')
             raise
 
     @contextmanager
@@ -146,15 +147,15 @@ class DatabaseCore:
             try:
                 connection.close()
             except Exception as close_error:
-                self._log_database_close_error(close_error)
+                self._log_cleanup_error(close_error)
                 try:
                     connection.close()
                 except Exception as retry_error:
-                    self._log_database_close_error(retry_error)
+                    self._log_cleanup_error(retry_error)
 
-    def _log_database_close_error(self, error):
+    def _log_cleanup_error(self, error, prefix='CACHE: ERROR closing _database'):
         try:
-            self.kodi_log(f'CACHE: ERROR closing _database: {error}\n{self._sc_name}', 2)
+            self.kodi_log(f'{prefix}: {error}\n{self._sc_name}', 2)
         except Exception:
             # Logging must never obscure a query or transaction failure.
             pass
@@ -203,7 +204,8 @@ class DatabaseCore:
                 except Exception as close_error:
                     if failed:
                         # A failed fetch is the primary error, not its cleanup.
-                        self.kodi_log(f'CACHE: cursor close error after failed query: {close_error}\n{self._sc_name}', 2)
+                        self._log_cleanup_error(
+                            close_error, prefix='CACHE: cursor close error after failed query')
                     elif wrap_fetch_errors:
                         raise _CursorCloseError(close_error) from close_error
                     else:

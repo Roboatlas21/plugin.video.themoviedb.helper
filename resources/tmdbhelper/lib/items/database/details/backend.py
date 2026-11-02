@@ -20,10 +20,10 @@ class DetailsDatabase(ItemDetailsDatabase):
             return connection.executemany(query, data)
         return connection.execute(query, data)
 
-    def execute_sql(self, query, data=None, read_only=False, connection=None):
+    def execute_sql(self, query, data=None, read_only=False, connection=None, fetch_rows=None):
         # Propagate failures to the coordinator so it can roll back the batch.
         return self._execute_sql(
-            query, data=data, read_only=read_only, connection=connection)
+            query, data=data, read_only=read_only, connection=connection, fetch_rows=fetch_rows)
 
 
 class DetailsConnection(DatabaseConnection):
