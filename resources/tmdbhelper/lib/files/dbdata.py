@@ -136,9 +136,28 @@ class DatabaseCore:
         connection = self.get_database(read_only=read_only)
         if connection is None:
             raise sqlite3.OperationalError('Database connection unavailable')
-        with closing(connection):
+        try:
             with connection:
                 yield connection
+        finally:
+            # Commit/rollback (and the result of the query) must not be replaced
+            # by a secondary failure while releasing the connection. Retry once
+            # if the first close fails before actually releasing the resource.
+            try:
+                connection.close()
+            except Exception as close_error:
+                self._log_database_close_error(close_error)
+                try:
+                    connection.close()
+                except Exception as retry_error:
+                    self._log_database_close_error(retry_error)
+
+    def _log_database_close_error(self, error):
+        try:
+            self.kodi_log(f'CACHE: ERROR closing _database: {error}\n{self._sc_name}', 2)
+        except Exception:
+            # Logging must never obscure a query or transaction failure.
+            pass
 
     def database_execute(self, connection, query, data=None):
         try:

@@ -2,41 +2,91 @@
 # -*- coding: utf-8 -*-
 from jurialmunkey.ftools import cached_property
 from contextlib import contextmanager
+from tmdbhelper.lib.addon.logger import kodi_log
 
 
 class DatabaseConnection:
     def __init__(self, cache):
         self.cache = cache
         self.open_connection = None
+        self._pending_close = None
 
-    def close(self):
-        cursor = self.open_connection
-        self.open_connection = None
-        if cursor is None:
-            return
-        database = cursor.connection
+    @staticmethod
+    def _log_cleanup_error(error):
         try:
-            cursor.close()
-        finally:
-            database.close()
+            kodi_log(f'CACHE: ERROR closing shared _database: {error}', 2)
+        except Exception:
+            # Do not replace the actual query/caller exception with a log error.
+            pass
+
+    def _close_pending(self):
+        database = self._pending_close
+        if database is None:
+            return
+        database.close()
+        self._pending_close = None
+
+    def close(self, suppress_db_close_error=False):
+        cursor = self.open_connection
+        if cursor is not None:
+            # Detach the cursor so a failed close can never make it reusable.
+            # Keep the underlying DB until close() really succeeds; callers can
+            # retry cleanup even if the initial close raised an exception.
+            database = cursor.connection
+            self.open_connection = None
+            self._pending_close = database
+            try:
+                cursor.close()
+            except BaseException:
+                try:
+                    self._close_pending()
+                except BaseException as close_error:
+                    self._log_cleanup_error(close_error)
+                raise
+        if suppress_db_close_error:
+            try:
+                self._close_pending()
+            except Exception as close_error:
+                # A completed operation stays successful even if its DB close
+                # fails. Cursor-finalisation errors still propagate as before.
+                self._log_cleanup_error(close_error)
+        else:
+            self._close_pending()
 
     @contextmanager
     def open(self):
         existing_connection = self.open_connection is not None
         if not existing_connection:
+            # Retry any previous failed close before opening a replacement.
+            # Never hand out a cursor from a database whose close failed.
+            self._close_pending()
             database = self.cache.get_database()
             if database is None:
                 raise RuntimeError('Database connection unavailable')
+            self._pending_close = database
             try:
                 self.open_connection = database.cursor()
             except BaseException:
-                database.close()
+                try:
+                    self._close_pending()
+                except BaseException as close_error:
+                    self._log_cleanup_error(close_error)
                 raise
+            self._pending_close = None
         try:
             yield self.open_connection
-        finally:
+        except BaseException:
             if not existing_connection:
-                self.close()
+                try:
+                    self.close()
+                except BaseException as close_error:
+                    self._log_cleanup_error(close_error)
+            raise
+        else:
+            if not existing_connection:
+                # Only suppress post-operation DB close failures. Cursor close
+                # failures retain their original, observable behavior.
+                self.close(suppress_db_close_error=True)
 
 
 class DatabaseAccess:
