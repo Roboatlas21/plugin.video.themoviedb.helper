@@ -29,9 +29,7 @@ class DatabaseConnection:
     def close(self, suppress_db_close_error=False):
         cursor = self.open_connection
         if cursor is not None:
-            # Detach the cursor so a failed close can never make it reusable.
-            # Keep the underlying DB until close() really succeeds; callers can
-            # retry cleanup even if the initial close raised an exception.
+            # Detach the cursor; retain the database until cleanup succeeds.
             database = cursor.connection
             self.open_connection = None
             self._pending_close = database
@@ -43,50 +41,44 @@ class DatabaseConnection:
                 except BaseException as close_error:
                     self._log_cleanup_error(close_error)
                 raise
-        if suppress_db_close_error:
-            try:
-                self._close_pending()
-            except Exception as close_error:
-                # A completed operation stays successful even if its DB close
-                # fails. Cursor-finalisation errors still propagate as before.
-                self._log_cleanup_error(close_error)
-        else:
+        try:
             self._close_pending()
+        except Exception as error:
+            if not suppress_db_close_error:
+                raise
+            self._log_cleanup_error(error)
 
     @contextmanager
     def open(self):
-        existing_connection = self.open_connection is not None
-        if not existing_connection:
-            # Retry any previous failed close before opening a replacement.
-            # Never hand out a cursor from a database whose close failed.
-            self._close_pending()
-            database = self.cache.get_database()
-            if database is None:
-                raise RuntimeError('Database connection unavailable')
-            self._pending_close = database
+        if self.open_connection is not None:
+            yield self.open_connection
+            return
+
+        # Only the outer scope owns cleanup. Never reuse a failed-close handle.
+        self._close_pending()
+        database = self.cache.get_database()
+        if database is None:
+            raise RuntimeError('Database connection unavailable')
+        self._pending_close = database
+        try:
+            self.open_connection = database.cursor()
+        except BaseException:
             try:
-                self.open_connection = database.cursor()
-            except BaseException:
-                try:
-                    self._close_pending()
-                except BaseException as close_error:
-                    self._log_cleanup_error(close_error)
-                raise
-            self._pending_close = None
+                self._close_pending()
+            except BaseException as error:
+                self._log_cleanup_error(error)
+            raise
+        self._pending_close = None
         try:
             yield self.open_connection
         except BaseException:
-            if not existing_connection:
-                try:
-                    self.close()
-                except BaseException as close_error:
-                    self._log_cleanup_error(close_error)
+            try:
+                self.close()
+            except BaseException as error:
+                self._log_cleanup_error(error)
             raise
         else:
-            if not existing_connection:
-                # Only suppress post-operation DB close failures. Cursor close
-                # failures retain their original, observable behavior.
-                self.close(suppress_db_close_error=True)
+            self.close(suppress_db_close_error=True)
 
 
 class DatabaseAccess:

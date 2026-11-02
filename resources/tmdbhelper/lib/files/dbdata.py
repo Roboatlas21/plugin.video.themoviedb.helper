@@ -12,16 +12,12 @@ DEFAULT_TABLE = 'simplecache'
 DATABASE_NAME = 'database_07'
 
 
-class _RowFetchError(Exception):
-    """Keep errors while materialising rows distinct from query setup errors."""
+class _CursorResultError(Exception):
+    """Let fetch and cursor-close errors pass through the SQL error handler."""
 
     def __init__(self, original):
         self.original = original
         super().__init__(str(original))
-
-
-class _CursorCloseError(_RowFetchError):
-    """Keep cursor cleanup failures distinct from SQL execution errors."""
 
 
 class DatabaseCore:
@@ -29,7 +25,7 @@ class DatabaseCore:
     _fileutils = FileUtils()  # Import to use plugin addon_data folder not the module one
     _db_timeout = 60.0
     _db_read_timeout = 1.0
-    _db_mmap_size = 0 if struct.calcsize('P') == 4 else 268435456
+    _db_mmap_size = 0 if struct.calcsize('P') == 4 else 256 * 1024 * 1024
     database_version = 1
     database_changes = {}
 
@@ -123,8 +119,7 @@ class DatabaseCore:
             connection.row_factory = sqlite3.Row
             return self.set_pragmas(connection)
         except Exception:
-            # Preserve the original PRAGMA/setup exception after releasing the
-            # connection. Connection creation errors still use the old policy.
+            # Preserve setup failures even if cleanup also fails.
             try:
                 connection.close()
             except Exception as close_error:
@@ -141,17 +136,14 @@ class DatabaseCore:
             with connection:
                 yield connection
         finally:
-            # Commit/rollback (and the result of the query) must not be replaced
-            # by a secondary failure while releasing the connection. Retry once
-            # if the first close fails before actually releasing the resource.
-            try:
-                connection.close()
-            except Exception as close_error:
-                self._log_cleanup_error(close_error)
+            # Retry cleanup once without changing the query result or exception.
+            for _ in range(2):
                 try:
                     connection.close()
-                except Exception as retry_error:
-                    self._log_cleanup_error(retry_error)
+                except Exception as error:
+                    self._log_cleanup_error(error)
+                else:
+                    break
 
     def _log_cleanup_error(self, error, prefix='CACHE: ERROR closing _database'):
         try:
@@ -172,8 +164,9 @@ class DatabaseCore:
         except Exception as other_exception:
             self.kodi_log(f'CACHE: database OTHER ERROR! -- {other_exception}\n{self._sc_name}\n--query--\n{query}\n--data--\n{data}', 2)
 
-    def _execute_sql(self, query, data=None, read_only=False, connection=None,
-                     fetch_rows=None, wrap_fetch_errors=False):
+    def _execute_sql(
+            self, query, data=None, read_only=False, connection=None,
+            fetch_rows=None, wrap_fetch_errors=False):
         """Materialise owned results; keep timeout selection independent of fetching.
 
         An explicitly supplied connection/cursor belongs to its caller and retains
@@ -193,7 +186,7 @@ class DatabaseCore:
                         return cursor.fetchall()
                     except Exception as error:
                         if wrap_fetch_errors:
-                            raise _RowFetchError(error) from error
+                            raise _CursorResultError(error) from error
                         raise
             except BaseException:
                 failed = True
@@ -207,7 +200,7 @@ class DatabaseCore:
                         self._log_cleanup_error(
                             close_error, prefix='CACHE: cursor close error after failed query')
                     elif wrap_fetch_errors:
-                        raise _CursorCloseError(close_error) from close_error
+                        raise _CursorResultError(close_error) from close_error
                     else:
                         raise
 
@@ -216,9 +209,8 @@ class DatabaseCore:
             return self._execute_sql(
                 query, data=data, read_only=read_only, connection=connection,
                 fetch_rows=fetch_rows, wrap_fetch_errors=True)
-        except _RowFetchError as error:
-            # Fetch and cursor-close errors historically reached callers.
-            # Preserve that policy after closing the owning database connection.
+        except _CursorResultError as error:
+            # Preserve the caller's original fetch/close error.
             raise error.original from error
         except Exception as database_exception:
             self.kodi_log(f'CACHE: database GET DATABASE ERROR! -- {database_exception}\n{self._sc_name} -- read_only: {read_only}', 2)
