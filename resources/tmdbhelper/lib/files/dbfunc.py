@@ -5,28 +5,38 @@ from contextlib import contextmanager
 
 
 class DatabaseConnection:
-    open_connection = None
-
     def __init__(self, cache):
         self.cache = cache
+        self.open_connection = None
 
     def close(self):
-        if not self.open_connection:
-            return
-        self.open_connection.close()
+        cursor = self.open_connection
         self.open_connection = None
+        if cursor is None:
+            return
+        database = cursor.connection
+        try:
+            cursor.close()
+        finally:
+            database.close()
 
     @contextmanager
     def open(self):
-        existing_connection = bool(self.open_connection)
-
+        existing_connection = self.open_connection is not None
         if not existing_connection:
-            self.open_connection = self.cache.get_database().cursor()
-
-        yield self.open_connection
-
-        if not existing_connection:
-            self.close()
+            database = self.cache.get_database()
+            if database is None:
+                raise RuntimeError('Database connection unavailable')
+            try:
+                self.open_connection = database.cursor()
+            except BaseException:
+                database.close()
+                raise
+        try:
+            yield self.open_connection
+        finally:
+            if not existing_connection:
+                self.close()
 
 
 class DatabaseAccess:

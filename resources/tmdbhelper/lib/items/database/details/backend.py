@@ -1,4 +1,3 @@
-from contextlib import contextmanager
 from jurialmunkey.ftools import cached_property
 from tmdbhelper.lib.addon.plugin import get_setting
 from tmdbhelper.lib.files.dbfunc import DatabaseConnection
@@ -22,34 +21,13 @@ class DetailsDatabase(ItemDetailsDatabase):
         return connection.execute(query, data)
 
     def execute_sql(self, query, data=None, read_only=False, connection=None):
-        if connection is not None:
-            return self.database_execute(connection, query, data)
-        with self.get_database(read_only=read_only) as connection:
-            return self.database_execute(connection, query, data)
+        # Propagate failures to the coordinator so it can roll back the batch.
+        return self._execute_sql(
+            query, data=data, read_only=read_only, connection=connection)
 
 
 class DetailsConnection(DatabaseConnection):
-    """Own both the cursor and connection, including rollback on failed batches."""
-
-    def close(self):
-        if self.open_connection is None:
-            return
-        connection = self.open_connection.connection
-        try:
-            super().close()
-        finally:
-            connection.close()
-
-    @contextmanager
-    def open(self):
-        existing_connection = self.open_connection is not None
-        if not existing_connection:
-            self.open_connection = self.cache.get_database().cursor()
-        try:
-            yield self.open_connection
-        finally:
-            if not existing_connection:
-                self.close()
+    """Item-details connection using shared, exception-safe cursor and DB ownership."""
 
 
 class DetailsLookup:
