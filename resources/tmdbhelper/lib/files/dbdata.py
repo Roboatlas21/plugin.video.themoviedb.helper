@@ -20,6 +20,10 @@ class _RowFetchError(Exception):
         super().__init__(str(original))
 
 
+class _CursorCloseError(_RowFetchError):
+    """Keep cursor cleanup failures distinct from SQL execution errors."""
+
+
 class DatabaseCore:
     _basefolder = get_setting('cache_location', 'str') or ''
     _fileutils = FileUtils()  # Import to use plugin addon_data folder not the module one
@@ -110,15 +114,22 @@ class DatabaseCore:
 
     def get_database(self, read_only=False, log_level=1):
         timeout = self._db_read_timeout if read_only else self._db_timeout
-        connection = None
         try:
             connection = sqlite3.connect(self._db_file, timeout=timeout)
+        except Exception as error:
+            self.kodi_log(f'CACHE: ERROR while retrieving _database: {error}\n{self._sc_name}', log_level)
+            return
+        try:
             connection.row_factory = sqlite3.Row
             return self.set_pragmas(connection)
-        except Exception as error:
-            if connection is not None:
+        except Exception:
+            # Preserve the original PRAGMA/setup exception after releasing the
+            # connection. Connection creation errors still use the old policy.
+            try:
                 connection.close()
-            self.kodi_log(f'CACHE: ERROR while retrieving _database: {error}\n{self._sc_name}', log_level)
+            except Exception as close_error:
+                self.kodi_log(f'CACHE: ERROR while closing failed _database setup: {close_error}\n{self._sc_name}', 2)
+            raise
 
     @contextmanager
     def database_session(self, read_only=False):
@@ -154,7 +165,8 @@ class DatabaseCore:
             cursor = self.database_execute(database, query, data=data)
             if cursor is None:
                 return
-            with closing(cursor):
+            failed = False
+            try:
                 should_fetch = read_only if fetch_rows is None else fetch_rows
                 if should_fetch:
                     try:
@@ -163,6 +175,20 @@ class DatabaseCore:
                         if wrap_fetch_errors:
                             raise _RowFetchError(error) from error
                         raise
+            except BaseException:
+                failed = True
+                raise
+            finally:
+                try:
+                    cursor.close()
+                except Exception as close_error:
+                    if failed:
+                        # A failed fetch is the primary error, not its cleanup.
+                        self.kodi_log(f'CACHE: cursor close error after failed query: {close_error}\n{self._sc_name}', 2)
+                    elif wrap_fetch_errors:
+                        raise _CursorCloseError(close_error) from close_error
+                    else:
+                        raise
 
     def execute_sql(self, query, data=None, read_only=False, connection=None, fetch_rows=None):
         try:
@@ -170,8 +196,8 @@ class DatabaseCore:
                 query, data=data, read_only=read_only, connection=connection,
                 fetch_rows=fetch_rows, wrap_fetch_errors=True)
         except _RowFetchError as error:
-            # Before materialisation moved inside execute_sql(), row-fetch errors
-            # propagated to callers. Preserve that policy after closing the DB.
+            # Fetch and cursor-close errors historically reached callers.
+            # Preserve that policy after closing the owning database connection.
             raise error.original from error
         except Exception as database_exception:
             self.kodi_log(f'CACHE: database GET DATABASE ERROR! -- {database_exception}\n{self._sc_name} -- read_only: {read_only}', 2)
